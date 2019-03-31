@@ -30,6 +30,9 @@ class Policy(nn.Module):
         """
         raise NotImplementedError()
 
+    def action_prob(self, obs: torch.tensor, act: int) -> float:
+        raise NotImplementedError()
+
     def init_from_parameters(self, parameters):
         cur_ind = 0
         for param in self.parameters():
@@ -64,7 +67,7 @@ class MujocoPolicy(Policy):
 
         mean     = self.action_mean.forward(encoded_state)
         log_std  = self.action_std.forward(encoded_state)    
-        return mean, 0.01
+        return mean, torch.exp(log_std)
 
     def sample_action(self, obs: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
@@ -78,6 +81,17 @@ class MujocoPolicy(Policy):
 
         entropies = distrib.Normal(mean, torch.diagflat(std)).entropy()
         return torch.sum(torch.diag(entropies))
+
+    def action_prob(self, obs: torch.tensor, act: int) -> float:
+        with torch.no_grad():
+            mean, std = self.forward(obs)
+
+        log_probs = distrib.Normal(mean, torch.diagflat(std)).log_prob(act)
+        log_probs = torch.diag(log_probs)
+        probs     = torch.exp(log_probs)
+        # To prevent eplosion of the PDF (means that we constantly choosing one action)
+        probs     = torch.clamp(probs, 0.0, 1.0)
+        return torch.prod(probs)
 
 class ClassicControlPolicy(Policy):
     def __init__(self, obs_size, act_size):
@@ -201,6 +215,17 @@ class ESMaxEntropyAgent(ESAgent):
         entropy = self.policy.action_entropy(self._transform_obs(prev_obs))
         return rew + 0.01 * entropy
 
+class ESMinEntropyAgent(ESAgent):
+    def _transform_train_rew(self, rew, action, prev_obs, obs):
+        entropy = self.policy.action_entropy(self._transform_obs(prev_obs))
+        return rew - entropy
+
+class ESWeightedProbAgent(ESAgent):
+    def _transform_train_rew(self, rew, action, prev_obs, obs):
+        prob = self.policy.action_prob(self._transform_obs(prev_obs), action)
+        return rew * prob
+
+
 class ESPopulation:
     def __init__(self, num_agents: int, num_trials:int, lr: float,
         initial_agent: ESAgent,agent_class, env_name: str, weights_std: float,
@@ -232,31 +257,6 @@ class ESPopulation:
         centroid_parameters           = unroll_parameters(self.centroid.parameters())
 
         report_rew = []
-        
-        # rollout_params = [self.num_trials, self.env_name, self.seed]
-        # res = []
-        # for j in range(0,self.num_agents,self.num_parallel): 
-        #     jobs = []
-        #     pipe_list = []
-        #     for ind in range(0, self.num_parallel):
-        #         r_e,s_e = mp.Pipe(False)
-        #         p = mp.Process(target = _step,args = (perturbs[j],deepcopy(self.agent_class),
-        #         deepcopy(self.centroid),deepcopy(rollout_params),s_e ))
-        #         jobs.append(p)
-        #         pipe_list.append(r_e)
-        #         p.start()
-            
-        #     for proc in jobs:
-        #         proc.join()
-        #     result_list = [p.recv() for p in pipe_list]
-        #     res.extend(result_list)
-
-
-        # perturbs_rew,perturbs_timesteps,pt2,report_rew,rr2 = list(zip(*res))
-        # perturbs_timesteps = list(perturbs_timesteps)
-        # report_rew = list(report_rew)
-        # perturbs_timesteps.extend(list(pt2))
-        # report_rew.extend(list(rr2))
 
         for ind in range(0, self.num_agents):
             perturb      = perturbs[ind]
@@ -316,21 +316,6 @@ class ESPopulation:
         
         return pertrubations
 
-def _step(perturb, agent_class,centroid,rollout_params : list,send_end):
-        centroid_parameters  = unroll_parameters(centroid.parameters())
-        local_agent = agent_class(centroid)
-
-        # Initialize agent with perturbed parameters
-        local_agent.policy.init_from_parameters(centroid_parameters + perturb)
-        reward, timesteps = local_agent.train_rollout(*rollout_params)
-        
-        # Initialize agent with anti perturbed parameters
-        local_agent.policy.init_from_parameters(centroid_parameters - perturb)
-        reward_anti, timesteps_anti = local_agent.train_rollout(*rollout_params)
-        
-        perturbs_rew = reward - reward_anti
-        send_end.send([perturbs_rew,timesteps,timesteps_anti,reward,reward_anti])
-        
 class Buffer:
   def __init__(self, num_params, size=10):
     self._replay   = [torch.zeros(num_params)] * size
@@ -392,6 +377,9 @@ class GuidedESPopulation(ESPopulation):
             grad_coeff = torch.sqrt(torch.tensor((1-self.alpha)/self.num_gradients))
             sample_grad = grad_coeff*torch.matmul(self.grads.q,self.grad_distr.sample())
             perturb = sampled_pertrubation+sample_grad
+            perturb *= self.weights_std
+
+            #print(perturb)
             # To be optimized
             pertrubations.append(perturb)
 
@@ -447,7 +435,7 @@ class GuidedESPopulation(ESPopulation):
         return report_rew, perturbs_timesteps
     
         
-seed       = 42
+seed       = 0
 env_name   = "Hopper-v2"
 fix_random_seeds(seed)
 writer     = SummaryWriter()
@@ -456,9 +444,9 @@ writer     = SummaryWriter()
 env        = gym.make(env_name)
 policy     = MujocoPolicy(len(env.observation_space.high), len(env.action_space.high))
 agent      = ESAgent(policy)
-population = GuidedESPopulation(num_agents=40, num_trials=5, lr=2,
+population = GuidedESPopulation(num_agents=40, num_trials=5, lr=0.01,
                 initial_agent=agent,agent_class=ESAgent,
-                env_name=env_name, weights_std=0.02, seed=seed,num_parallel=3,num_gradients=10,alpha=1/2)
+                env_name=env_name, weights_std=0.02, seed=seed,num_parallel=3,num_gradients=10,alpha=0.85)
 
 
 
