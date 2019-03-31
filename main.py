@@ -64,7 +64,7 @@ class MujocoPolicy(Policy):
 
         mean     = self.action_mean.forward(encoded_state)
         log_std  = self.action_std.forward(encoded_state)    
-        return mean, torch.exp(log_std)
+        return mean, 0.01
 
     def sample_action(self, obs: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
@@ -338,7 +338,7 @@ class Buffer:
 
     self._cur_size = 0
     self._index    = 0
-    q,_ = torch.qr(torch.stack(self._replay))
+    q,_ = torch.qr(torch.stack(self._replay).t())
     self.q = q
 
   def append(self, memento):
@@ -348,7 +348,7 @@ class Buffer:
  
 
   def update_orthogonal(self):
-    q,_ = torch.qr(torch.stack(self._replay))
+    q,_ = torch.qr(torch.stack(self._replay).t())
     self.q = q
 
 class GuidedESPopulation(ESPopulation):
@@ -371,11 +371,11 @@ class GuidedESPopulation(ESPopulation):
         self.num_parameters      = count_parameters(self.centroid)
         self.num_gradients       = num_gradients
 
-        self.pertrubations_distr = distrib.MultivariateNormal(torch.zeros(self.num_parameters),
-                                                            torch.eye(self.num_parameters))
+        self.pertrubations_distr = distrib.Normal(torch.zeros(self.num_parameters),
+                                                            1)
         
-        self.grad_distr          =  distrib.MultivariateNormal(torch.zeros(self.num_gradients),
-                                                            torch.eye(self.num_gradients))
+        self.grad_distr          =  distrib.Normal(torch.zeros(self.num_gradients),
+                                                            1)
 
         self.alpha = alpha
         
@@ -388,12 +388,13 @@ class GuidedESPopulation(ESPopulation):
         for _ in range(num_samples):
             perturb_coeff = torch.sqrt(torch.tensor(self.alpha/self.num_parameters))
             sampled_pertrubation = self.pertrubations_distr.sample()
+
             grad_coeff = torch.sqrt(torch.tensor((1-self.alpha)/self.num_gradients))
             sample_grad = grad_coeff*torch.matmul(self.grads.q,self.grad_distr.sample())
             perturb = sampled_pertrubation+sample_grad
             # To be optimized
             pertrubations.append(perturb)
-        
+
         return pertrubations
     
     def step(self) -> Tuple[List[float], List[float]]:
@@ -435,6 +436,7 @@ class GuidedESPopulation(ESPopulation):
             grad = torch.tensor(transformed_rews[ind] * perturbs[ind])
             total_grad += grad * (self.lr) / (2 * self.num_agents * self.weights_std**2)
         
+        
         self.grads.append(total_grad)
         self.grads.update_orthogonal()
         centroid_parameters += total_grad
@@ -445,7 +447,7 @@ class GuidedESPopulation(ESPopulation):
         return report_rew, perturbs_timesteps
     
         
-seed       = 0
+seed       = 42
 env_name   = "Hopper-v2"
 fix_random_seeds(seed)
 writer     = SummaryWriter()
@@ -457,6 +459,7 @@ agent      = ESAgent(policy)
 population = GuidedESPopulation(num_agents=40, num_trials=5, lr=2,
                 initial_agent=agent,agent_class=ESAgent,
                 env_name=env_name, weights_std=0.02, seed=seed,num_parallel=3,num_gradients=10,alpha=1/2)
+
 
 
 for cur_iter in range(10000):
