@@ -465,3 +465,5 @@ for cur_iter in range(10000):
     writer.add_scalar("Training steps",  np.mean(train_steps), cur_iter)
     writer.add_scalar("Test reward", test_reward, cur_iter)
     writer.add_scalar("Test steps",  test_steps,  cur_iter)
+    if cur_iter == 10:
+        population.lr = 2
