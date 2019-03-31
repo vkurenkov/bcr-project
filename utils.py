@@ -15,11 +15,11 @@ def fix_random_seeds(seed: int) -> None:
     np.random.seed(seed)
     random.seed(seed)
 
-def normc_initializer(m):
+def normc_initializer(std, m):
     with torch.no_grad():
         if type(m) == nn.Linear:
             init.normal_(m.weight)
-            m.weight *= 1.0 / torch.sqrt(torch.sum(m.weight**2))
+            m.weight *= std / torch.sqrt(torch.sum(m.weight**2))
 
 def count_parameters(policy) -> int:
     return sum(p.numel() for p in policy.parameters())
