@@ -331,6 +331,120 @@ def _step(perturb, agent_class,centroid,rollout_params : list,send_end):
         perturbs_rew = reward - reward_anti
         send_end.send([perturbs_rew,timesteps,timesteps_anti,reward,reward_anti])
         
+class Buffer:
+  def __init__(self, num_params, size=10):
+    self._replay   = [torch.zeros(num_params)] * size
+    self._size     = size
+
+    self._cur_size = 0
+    self._index    = 0
+    q,_ = torch.qr(torch.stack(self._replay))
+    self.q = q
+
+  def append(self, memento):
+    self._replay[self._index] = memento
+    self._index    = (self._index + 1) % self._size
+    self._cur_size = min(self._cur_size + 1, self._size)
+ 
+
+  def update_orthogonal(self):
+    q,_ = torch.qr(torch.stack(self._replay))
+    self.q = q
+
+class GuidedESPopulation(ESPopulation):
+    def __init__(self, num_agents: int, num_trials:int, lr: float,
+        initial_agent: ESAgent,agent_class, env_name: str, weights_std: float,
+        seed: int, num_parallel: int,alpha : int,
+        num_gradients : int):        
+        self.num_parallel = num_parallel
+
+        self.num_agents  = num_agents
+        self.num_trials  = num_trials
+        self.env_name    = env_name
+
+        self.agent       = initial_agent
+        self.seed        = seed
+        self.lr          = lr    
+
+        self.centroid            = deepcopy(initial_agent.policy)
+        self.weights_std         = weights_std
+        self.num_parameters      = count_parameters(self.centroid)
+        self.num_gradients       = num_gradients
+
+        self.pertrubations_distr = distrib.MultivariateNormal(torch.zeros(self.num_parameters),
+                                                            torch.eye(self.num_parameters))
+        
+        self.grad_distr          =  distrib.MultivariateNormal(torch.zeros(self.num_gradients),
+                                                            torch.eye(self.num_gradients))
+
+        self.alpha = alpha
+        
+        self.grads = Buffer(self.num_parameters,num_gradients)
+
+    
+    def _sample_pertrubations(self, num_samples: int) -> [torch.tensor]:
+        pertrubations           = []
+
+        for _ in range(num_samples):
+            perturb_coeff = torch.sqrt(torch.tensor(self.alpha/self.num_parameters))
+            sampled_pertrubation = self.pertrubations_distr.sample()
+            grad_coeff = torch.sqrt(torch.tensor((1-self.alpha)/self.num_gradients))
+            sample_grad = grad_coeff*torch.matmul(self.grads.q,self.grad_distr.sample())
+            perturb = sampled_pertrubation+sample_grad
+            # To be optimized
+            pertrubations.append(perturb)
+        
+        return pertrubations
+    
+    def step(self) -> Tuple[List[float], List[float]]:
+        """
+        Optimizes the entire population with antithetic sampling.
+        Returns training population rewards and timesteps for the current step.
+        """
+        perturbs = self._sample_pertrubations(self.num_agents)
+        perturbs_rew                  = []
+        perturbs_timesteps            = []
+        centroid_parameters           = unroll_parameters(self.centroid.parameters())
+
+        report_rew = []
+        for ind in range(0, self.num_agents):
+            perturb      = perturbs[ind]
+
+            # Initialize agent with perturbed parameters
+            self.agent.policy.init_from_parameters(centroid_parameters + perturb)
+            reward, timesteps = self.agent.train_rollout(self.num_trials, self.env_name, self.seed)
+            
+            # Initialize agent with anti perturbed parameters
+            self.agent.policy.init_from_parameters(centroid_parameters - perturb)
+            reward_anti, timesteps_anti = self.agent.train_rollout(self.num_trials, self.env_name, self.seed)
+
+            perturbs_rew.append(reward - reward_anti)
+
+            perturbs_timesteps.append(timesteps)
+            perturbs_timesteps.append(timesteps_anti)
+            report_rew.append(reward)
+            report_rew.append(reward_anti)
+
+        # Transform rewards as in Salimans et al. (2017)
+        transformed_rews = compute_centered_ranks(np.array(perturbs_rew))
+
+        # GRADIENT ASCENT
+        perturbs = np.stack(perturbs)
+        total_grad = torch.zeros(self.num_parameters)
+        for ind in range(0, self.num_agents):
+            grad = torch.tensor(transformed_rews[ind] * perturbs[ind])
+            total_grad += grad * (self.lr) / (2 * self.num_agents * self.weights_std**2)
+        
+        self.grads.append(total_grad)
+        self.grads.update_orthogonal()
+        centroid_parameters += total_grad
+        # Update the centroid
+        self.centroid.init_from_parameters(centroid_parameters)
+        print("Gradient norm: {}".format(torch.norm(grad, p=2)))
+
+        return report_rew, perturbs_timesteps
+    
+        
 seed       = 0
 env_name   = "Hopper-v2"
 fix_random_seeds(seed)
@@ -340,9 +454,10 @@ writer     = SummaryWriter()
 env        = gym.make(env_name)
 policy     = MujocoPolicy(len(env.observation_space.high), len(env.action_space.high))
 agent      = ESAgent(policy)
-population = ESPopulation(num_agents=40, num_trials=5, lr=0.01,
+population = GuidedESPopulation(num_agents=40, num_trials=5, lr=2,
                 initial_agent=agent,agent_class=ESAgent,
-                env_name=env_name, weights_std=0.02, seed=seed,num_parallel=3)
+                env_name=env_name, weights_std=0.02, seed=seed,num_parallel=3,num_gradients=10,alpha=1/2)
+
 
 for cur_iter in range(10000):
     print("\nIteration #{}".format(cur_iter))
